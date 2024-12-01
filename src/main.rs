@@ -1,11 +1,16 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest, http::header};
 use chrono::Utc;
+use futures::StreamExt;
 use serde::Serialize;
 use serde_xml_rs::to_string;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use log::{info, warn, error, debug};
-use std::time::Instant;
+use tokio::sync::Mutex;
+use tokio::time;
+use std::collections::HashMap;
 
 #[derive(Serialize)]
 struct ListBucketResult {
@@ -35,10 +40,6 @@ struct Contents {
     size: i64,
     #[serde(rename = "StorageClass")]
     storage_class: String,
-}
-
-struct AppState {
-    storage_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -84,6 +85,19 @@ impl ByteRange {
     }
 }
 
+struct DownloadProgress {
+    client_info: String,
+    filename: String,
+    total_size: u64,
+    bytes_sent: u64,
+    start_time: Instant,
+}
+
+struct AppState {
+    storage_path: PathBuf,
+    downloads: Arc<Mutex<HashMap<String, DownloadProgress>>>,
+}
+
 fn get_client_info(req: &HttpRequest) -> String {
     let ip = req.peer_addr().map_or("unknown".to_string(), |addr| addr.to_string());
     let user_agent = req.headers()
@@ -93,8 +107,37 @@ fn get_client_info(req: &HttpRequest) -> String {
     format!("Client IP: {}, User-Agent: {}", ip, user_agent)
 }
 
+async fn progress_logger(downloads: Arc<Mutex<HashMap<String, DownloadProgress>>>) {
+    let mut interval = time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let mut guard = downloads.lock().await;
+        
+        for (_, progress) in guard.iter() {
+            let elapsed = progress.start_time.elapsed();
+            let speed = if elapsed.as_secs() > 0 {
+                progress.bytes_sent / elapsed.as_secs()
+            } else {
+                0
+            };
+            
+            info!(
+                "\r{} - {} - {}/{} bytes ({:.2}%) - {:.2} MB/s",
+                progress.client_info,
+                progress.filename,
+                progress.bytes_sent,
+                progress.total_size,
+                (progress.bytes_sent as f64 / progress.total_size as f64) * 100.0,
+                speed as f64 / (1024.0 * 1024.0)
+            );
+        }
+        
+        guard.retain(|_, progress| progress.bytes_sent < progress.total_size);
+    }
+}
+
 async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    let start_time = Instant::now();
+    let start = Instant::now();
     info!("List objects request received from {}", get_client_info(&req));
     
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
@@ -140,7 +183,7 @@ async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Respo
     
     info!(
         "List operation completed in {:?}. Found {} files, total size: {} bytes",
-        start_time.elapsed(),
+        start.elapsed(),
         file_count,
         total_size
     );
@@ -190,7 +233,7 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
                                 "Serving partial content for '{}': bytes {}-{}/{} to {}",
                                 path, byte_range.start, end, file_size, client_info
                             );
-                            
+
                             return HttpResponse::PartialContent()
                                 .append_header(("Content-Range", format!("bytes {}-{}/{}", byte_range.start, end, file_size)))
                                 .append_header(("Content-Length", length.to_string()))
@@ -209,32 +252,57 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
             .finish();
     }
 
-    match fs::read(&file_path) {
-        Ok(contents) => {
-            info!(
-                "File '{}' ({} bytes) served successfully to {} in {:?}",
-                path,
-                file_size,
-                client_info,
-                start_time.elapsed()
-            );
+    let download_id = format!("{}-{}", Utc::now().timestamp_millis(), path);
+    let progress = DownloadProgress {
+        client_info: client_info.clone(),
+        filename: path.to_string(),
+        total_size: file_size,
+        bytes_sent: 0,
+        start_time: Instant::now(),
+    };
+    
+    data.downloads.lock().await.insert(download_id.clone(), progress);
 
-            HttpResponse::Ok()
-                .content_type("application/octet-stream")
-                .append_header(("ETag", etag))
-                .append_header(("Last-Modified", last_modified))
-                .append_header(("Accept-Ranges", "bytes"))
-                .append_header(("Content-Length", file_size.to_string()))
-                .append_header(("x-amz-request-id", format!("TX{}", Utc::now().timestamp())))
-                .body(contents)
-        }
+    let file = match fs::File::open(&file_path) {
+        Ok(file) => file,
         Err(e) => {
-            error!("Error reading file '{}': {}", path, e);
-            HttpResponse::InternalServerError().finish()
+            error!("Failed to open file: {}", e);
+            return HttpResponse::InternalServerError().finish();
         }
-    }
-}
+    };
 
+    let downloads = Arc::clone(&data.downloads);
+    let download_id = download_id.clone();
+
+    let file = tokio::fs::File::from_std(file);
+    let stream = tokio_util::io::ReaderStream::new(file);
+    
+    let mapped_stream = stream.map(move |result| {
+        match result {
+            Ok(chunk) => {
+                let chunk_len = chunk.len() as u64;
+                let downloads = downloads.clone();
+                let download_id = download_id.clone();
+                tokio::spawn(async move {
+                    let mut guard = downloads.lock().await;
+                    if let Some(progress) = guard.get_mut(&download_id) {
+                        progress.bytes_sent += chunk_len;
+                    }
+                });
+                Ok(chunk)
+            }
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+        }
+    });
+
+    HttpResponse::Ok()
+        .append_header(("ETag", etag))
+        .append_header(("Last-Modified", last_modified))
+        .append_header(("Accept-Ranges", "bytes"))
+        .append_header(("Content-Length", file_size.to_string()))
+        .append_header(("x-amz-request-id", format!("TX{}", Utc::now().timestamp())))
+        .streaming(mapped_stream)
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -258,77 +326,34 @@ async fn main() -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to create storage directory"));
     }
 
-    // Get server IP and port from environment variables or use defaults
+    let downloads = Arc::new(Mutex::new(HashMap::new()));
+    let downloads_clone = Arc::clone(&downloads);
+
+    tokio::spawn(async move {
+        progress_logger(downloads_clone).await;
+    });
+
     let host = std::env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port = std::env::var("SERVER_PORT").unwrap_or_else(|_| "8080".to_string());
-    let bind_address = format!("{}:{}", host, port);
+    let port = std::env::var("SERVER_PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse()
+        .unwrap_or(8080);
 
-    info!("⚠️  Server starting in PUBLIC mode - accepting connections from all interfaces");
-    info!("🌐 Binding to {}", bind_address);
+    info!("⚠️  Server starting in PUBLIC mode");
+    info!("🌐 Binding to {}:{}", host, port);
     info!("📂 Serving files from ./storage directory");
-
-    // Log local IP addresses
-    if let Ok(interfaces) = get_network_interfaces() {
-        info!("Available network interfaces:");
-        for (ip, kind) in interfaces {
-            info!("  - {} ({})", ip, kind);
-        }
-    }
-
-    if let Ok(entries) = fs::read_dir(&storage_path) {
-        info!("Initial storage directory contents:");
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(file_name) = entry.file_name().into_string() {
-                    info!("  - {} ({} bytes)", file_name, metadata.len());
-                }
-            }
-        }
-    }
 
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(AppState {
                 storage_path: storage_path.clone(),
+                downloads: Arc::clone(&downloads),
             }))
             .wrap(actix_web::middleware::Logger::default())
             .route("/", web::get().to(list_objects))
             .route("/{filename:.*}", web::get().to(get_object))
     })
-    .bind(&bind_address)?
+    .bind((host, port))?
     .run()
     .await
-}
-
-// Helper function to get network interfaces
-fn get_network_interfaces() -> std::io::Result<Vec<(String, String)>> {
-    use std::net::{IpAddr, Ipv4Addr};
-    let mut interfaces = Vec::new();
-    
-    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&("0.0.0.0:0", 0)) {
-        for addr in addrs {
-            let ip = addr.ip();
-            let kind = match ip {
-                IpAddr::V4(ip4) => {
-                    if ip4.is_loopback() {
-                        "loopback".to_string()
-                    } else if ip4.is_private() {
-                        "private".to_string()
-                    } else {
-                        "public".to_string()
-                    }
-                },
-                IpAddr::V6(ip6) => {
-                    if ip6.is_loopback() {
-                        "loopback (IPv6)".to_string()
-                    } else {
-                        "IPv6".to_string()
-                    }
-                }
-            };
-            interfaces.push((ip.to_string(), kind));
-        }
-    }
-    
-    Ok(interfaces)
 }
