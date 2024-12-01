@@ -235,6 +235,7 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
     }
 }
 
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -257,9 +258,23 @@ async fn main() -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to create storage directory"));
     }
 
-    info!("Server starting - files will be served from ./storage directory");
-    info!("You can access the server at http://127.0.0.1:8080");
-    
+    // Get server IP and port from environment variables or use defaults
+    let host = std::env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = std::env::var("SERVER_PORT").unwrap_or_else(|_| "8080".to_string());
+    let bind_address = format!("{}:{}", host, port);
+
+    info!("⚠️  Server starting in PUBLIC mode - accepting connections from all interfaces");
+    info!("🌐 Binding to {}", bind_address);
+    info!("📂 Serving files from ./storage directory");
+
+    // Log local IP addresses
+    if let Ok(interfaces) = get_network_interfaces() {
+        info!("Available network interfaces:");
+        for (ip, kind) in interfaces {
+            info!("  - {} ({})", ip, kind);
+        }
+    }
+
     if let Ok(entries) = fs::read_dir(&storage_path) {
         info!("Initial storage directory contents:");
         for entry in entries.flatten() {
@@ -276,10 +291,44 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(AppState {
                 storage_path: storage_path.clone(),
             }))
+            .wrap(actix_web::middleware::Logger::default())
             .route("/", web::get().to(list_objects))
             .route("/{filename:.*}", web::get().to(get_object))
     })
-    .bind("127.0.0.1:8080")?
+    .bind(&bind_address)?
     .run()
     .await
+}
+
+// Helper function to get network interfaces
+fn get_network_interfaces() -> std::io::Result<Vec<(String, String)>> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let mut interfaces = Vec::new();
+    
+    if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&("0.0.0.0:0", 0)) {
+        for addr in addrs {
+            let ip = addr.ip();
+            let kind = match ip {
+                IpAddr::V4(ip4) => {
+                    if ip4.is_loopback() {
+                        "loopback".to_string()
+                    } else if ip4.is_private() {
+                        "private".to_string()
+                    } else {
+                        "public".to_string()
+                    }
+                },
+                IpAddr::V6(ip6) => {
+                    if ip6.is_loopback() {
+                        "loopback (IPv6)".to_string()
+                    } else {
+                        "IPv6".to_string()
+                    }
+                }
+            };
+            interfaces.push((ip.to_string(), kind));
+        }
+    }
+    
+    Ok(interfaces)
 }
