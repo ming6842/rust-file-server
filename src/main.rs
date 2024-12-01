@@ -194,7 +194,6 @@ async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Respo
 }
 
 async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
-    let start_time = Instant::now();
     let client_info = get_client_info(&req);
     info!("Get object request received for '{}' from {}", path, client_info);
 
@@ -210,8 +209,28 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
     };
 
     let file_size = metadata.len();
-    let etag = format!("\"{}\"", metadata.len());
-    let last_modified = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    
+    // Calculate MD5 hash for ETag
+    let mut file = match fs::File::open(&file_path) {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to open file: {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+    
+    // Read the file content for MD5 calculation
+    let mut buffer = Vec::new();
+    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut buffer) {
+        error!("Failed to read file for MD5 calculation: {}", e);
+        return HttpResponse::InternalServerError().finish();
+    }
+    
+    // Calculate MD5 hash
+    let etag = format!("\"{:x}\"", md5::compute(&buffer));
+    let last_modified = chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
 
     if let Some(range_header) = req.headers().get(header::RANGE) {
         if let Some(range_str) = range_header.to_str().ok() {
@@ -234,14 +253,19 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
                                 path, byte_range.start, end, file_size, client_info
                             );
 
-                            return HttpResponse::PartialContent()
+                            let mut response = HttpResponse::PartialContent();
+                            response
                                 .append_header(("Content-Range", format!("bytes {}-{}/{}", byte_range.start, end, file_size)))
                                 .append_header(("Content-Length", length.to_string()))
-                                .append_header(("ETag", etag))
                                 .append_header(("Last-Modified", last_modified))
+                                .append_header(("ETag", etag))
                                 .append_header(("Accept-Ranges", "bytes"))
-                                .append_header(("x-amz-request-id", format!("TX{}", Utc::now().timestamp())))
-                                .body(buffer);
+                                .append_header(("x-amz-server-side-encryption", "AES256"))
+                                .append_header(("Content-Type", "binary/octet-stream"))
+                                .append_header(("Server", "AmazonS3"))
+                                .append_header(("Connection", "close"));
+
+                            return response.body(buffer);
                         }
                     }
                 }
@@ -263,20 +287,12 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
     
     data.downloads.lock().await.insert(download_id.clone(), progress);
 
-    let file = match fs::File::open(&file_path) {
-        Ok(file) => file,
-        Err(e) => {
-            error!("Failed to open file: {}", e);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
-
-    let downloads = Arc::clone(&data.downloads);
-    let download_id = download_id.clone();
-
     let file = tokio::fs::File::from_std(file);
     let stream = tokio_util::io::ReaderStream::new(file);
     
+    let downloads = Arc::clone(&data.downloads);
+    let download_id = download_id.clone();
+
     let mapped_stream = stream.map(move |result| {
         match result {
             Ok(chunk) => {
@@ -295,13 +311,18 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
         }
     });
 
-    HttpResponse::Ok()
-        .append_header(("ETag", etag))
+    let mut response = HttpResponse::Ok();
+    response
         .append_header(("Last-Modified", last_modified))
+        .append_header(("ETag", etag))
+        .append_header(("x-amz-server-side-encryption", "AES256"))
         .append_header(("Accept-Ranges", "bytes"))
+        .append_header(("Content-Type", "binary/octet-stream"))
         .append_header(("Content-Length", file_size.to_string()))
-        .append_header(("x-amz-request-id", format!("TX{}", Utc::now().timestamp())))
-        .streaming(mapped_stream)
+        .append_header(("Server", "AmazonS3"))
+        .append_header(("Connection", "close"));
+
+    response.streaming(mapped_stream)
 }
 
 #[actix_web::main]
