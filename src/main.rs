@@ -199,7 +199,6 @@ async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Respo
 
     HttpResponse::Ok().content_type("application/xml").body(xml)
 }
-
 async fn get_object(
     req: HttpRequest,
     path: web::Path<String>,
@@ -246,6 +245,9 @@ async fn get_object(
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string();
 
+    const RATE_LIMIT: u64 = 1000; // bytes per second
+    const CHUNK_SIZE: usize = 1000; // bytes per chunk
+
     if let Some(range_header) = req.headers().get(header::RANGE) {
         if let Some(range_str) = range_header.to_str().ok() {
             debug!("Range header received: {}", range_str);
@@ -256,38 +258,110 @@ async fn get_object(
                     byte_range.start, byte_range.end
                 );
 
-                if let Ok(mut file) = fs::File::open(&file_path) {
-                    use std::io::{Read, Seek, SeekFrom};
+                if let Ok(file) = fs::File::open(&file_path) {
+                    let end = byte_range.end.unwrap_or(file_size - 1);
+                    let length = end - byte_range.start + 1;
 
-                    if file.seek(SeekFrom::Start(byte_range.start)).is_ok() {
-                        let end = byte_range.end.unwrap_or(file_size - 1);
-                        let length = end - byte_range.start + 1;
-                        let mut buffer = vec![0; length as usize];
+                    let download_id = format!("{}-{}-partial", Utc::now().timestamp_millis(), path);
+                    let progress = DownloadProgress {
+                        client_info: client_info.clone(),
+                        filename: path.to_string(),
+                        total_size: length,
+                        bytes_sent: 0,
+                        start_time: Instant::now(),
+                        last_chunk_time: Instant::now(),
+                    };
 
-                        if file.read_exact(&mut buffer).is_ok() {
-                            info!(
-                                "Serving partial content for '{}': bytes {}-{}/{} to {}",
-                                path, byte_range.start, end, file_size, client_info
-                            );
+                    data.downloads
+                        .lock()
+                        .await
+                        .insert(download_id.clone(), progress);
 
-                            let mut response = HttpResponse::PartialContent();
-                            response
-                                .append_header((
-                                    "Content-Range",
-                                    format!("bytes {}-{}/{}", byte_range.start, end, file_size),
-                                ))
-                                .append_header(("Content-Length", length.to_string()))
-                                .append_header(("Last-Modified", last_modified))
-                                .append_header(("ETag", etag))
-                                .append_header(("Accept-Ranges", "bytes"))
-                                .append_header(("x-amz-server-side-encryption", "AES256"))
-                                .append_header(("Content-Type", "binary/octet-stream"))
-                                .append_header(("Server", "AmazonS3"))
-                                .append_header(("Connection", "close"));
+                    let file = tokio::fs::File::from_std(file);
+                    let stream = tokio_util::io::ReaderStream::new(file)
+                        .skip(byte_range.start as usize / CHUNK_SIZE)
+                        .take((length as usize + CHUNK_SIZE - 1) / CHUNK_SIZE);
 
-                            return response.body(buffer);
+                    let downloads = Arc::clone(&data.downloads);
+                    let download_id_clone = download_id.clone();
+
+                    let rate_limited_stream = stream.then(move |result| {
+                        let downloads = downloads.clone();
+                        let download_id = download_id_clone.clone();
+
+                        async move {
+                            match result {
+                                Ok(chunk) => {
+                                    let mut remaining_chunk = chunk;
+                                    let mut processed_chunk = Vec::new();
+
+                                    while !remaining_chunk.is_empty() {
+                                        let current_size =
+                                            std::cmp::min(remaining_chunk.len(), CHUNK_SIZE);
+                                        let current_chunk = remaining_chunk.slice(0..current_size);
+                                        remaining_chunk = remaining_chunk.slice(current_size..);
+
+                                        let chunk_len = current_chunk.len() as u64;
+
+                                        // Update progress and apply rate limiting
+                                        let mut guard = downloads.lock().await;
+                                        if let Some(progress) = guard.get_mut(&download_id) {
+                                            let elapsed = progress.last_chunk_time.elapsed();
+                                            let required_delay = Duration::from_secs_f64(
+                                                chunk_len as f64 / RATE_LIMIT as f64,
+                                            );
+
+                                            // If we need to wait longer to maintain the rate limit, sleep
+                                            if elapsed < required_delay {
+                                                let sleep_duration = required_delay - elapsed;
+                                                drop(guard); // Release the lock before sleeping
+                                                time::sleep(sleep_duration).await;
+                                                guard = downloads.lock().await;
+                                                if let Some(progress) = guard.get_mut(&download_id)
+                                                {
+                                                    progress.bytes_sent += chunk_len;
+                                                    progress.last_chunk_time = Instant::now();
+                                                }
+                                            } else {
+                                                progress.bytes_sent += chunk_len;
+                                                progress.last_chunk_time = Instant::now();
+                                            }
+                                        }
+
+                                        processed_chunk.extend_from_slice(&current_chunk);
+                                    }
+
+                                    Ok(Bytes::from(processed_chunk))
+                                }
+                                Err(e) => Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    e.to_string(),
+                                )),
+                            }
                         }
-                    }
+                    });
+
+                    info!(
+                        "Serving partial content for '{}': bytes {}-{}/{} to {}",
+                        path, byte_range.start, end, file_size, client_info
+                    );
+
+                    let mut response = HttpResponse::PartialContent();
+                    response
+                        .append_header((
+                            "Content-Range",
+                            format!("bytes {}-{}/{}", byte_range.start, end, file_size),
+                        ))
+                        .append_header(("Content-Length", length.to_string()))
+                        .append_header(("Last-Modified", last_modified))
+                        .append_header(("ETag", etag))
+                        .append_header(("Accept-Ranges", "bytes"))
+                        .append_header(("x-amz-server-side-encryption", "AES256"))
+                        .append_header(("Content-Type", "binary/octet-stream"))
+                        .append_header(("Server", "AmazonS3"))
+                        .append_header(("Connection", "close"));
+
+                    return response.streaming(rate_limited_stream);
                 }
             }
         }
@@ -295,7 +369,6 @@ async fn get_object(
             .append_header(("Content-Range", format!("bytes */{}", file_size)))
             .finish();
     }
-
     // Create a new file handle for streaming
     let std_file = match fs::File::open(&file_path) {
         Ok(file) => file,
@@ -322,9 +395,6 @@ async fn get_object(
 
     let file = tokio::fs::File::from_std(std_file);
     let stream = tokio_util::io::ReaderStream::new(file);
-
-    const RATE_LIMIT: u64 = 1000; // bytes per second
-    const CHUNK_SIZE: usize = 1000; // bytes per chunk
 
     let downloads = Arc::clone(&data.downloads);
     let download_id_clone = download_id.clone();
