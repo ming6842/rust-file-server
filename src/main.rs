@@ -1,16 +1,18 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest, http::header};
+use actix_web::{
+    http::header, web, web::Bytes, App, HttpRequest, HttpResponse, HttpServer, Responder,
+};
 use chrono::Utc;
 use futures::StreamExt;
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use serde_xml_rs::to_string;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use log::{info, warn, error, debug};
 use tokio::sync::Mutex;
 use tokio::time;
-use std::collections::HashMap;
 
 #[derive(Serialize)]
 struct ListBucketResult {
@@ -52,10 +54,10 @@ impl ByteRange {
     fn parse(range_header: &str, file_size: u64) -> Option<ByteRange> {
         let range_str = range_header.strip_prefix("bytes=")?;
         let mut parts = range_str.split('-');
-        
+
         let start_str = parts.next()?;
         let end_str = parts.next()?;
-        
+
         let start = if start_str.is_empty() {
             if let Ok(last_n) = end_str.parse::<u64>() {
                 if last_n > file_size {
@@ -69,14 +71,14 @@ impl ByteRange {
         } else {
             start_str.parse::<u64>().ok()?
         };
-        
+
         let end = if end_str.is_empty() {
             Some(file_size - 1)
         } else {
             let parsed_end = end_str.parse::<u64>().ok()?;
             Some(std::cmp::min(parsed_end, file_size - 1))
         };
-        
+
         if start > file_size - 1 || end.map_or(false, |e| e < start) {
             None
         } else {
@@ -91,6 +93,7 @@ struct DownloadProgress {
     total_size: u64,
     bytes_sent: u64,
     start_time: Instant,
+    last_chunk_time: Instant, // Added to track time between chunks
 }
 
 struct AppState {
@@ -99,8 +102,11 @@ struct AppState {
 }
 
 fn get_client_info(req: &HttpRequest) -> String {
-    let ip = req.peer_addr().map_or("unknown".to_string(), |addr| addr.to_string());
-    let user_agent = req.headers()
+    let ip = req
+        .peer_addr()
+        .map_or("unknown".to_string(), |addr| addr.to_string());
+    let user_agent = req
+        .headers()
         .get("user-agent")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("unknown");
@@ -112,7 +118,7 @@ async fn progress_logger(downloads: Arc<Mutex<HashMap<String, DownloadProgress>>
     loop {
         interval.tick().await;
         let mut guard = downloads.lock().await;
-        
+
         for (_, progress) in guard.iter() {
             let elapsed = progress.start_time.elapsed();
             let speed = if elapsed.as_secs() > 0 {
@@ -120,7 +126,7 @@ async fn progress_logger(downloads: Arc<Mutex<HashMap<String, DownloadProgress>>
             } else {
                 0
             };
-            
+
             info!(
                 "\r{} - {} - {}/{} bytes ({:.2}%) - {:.2} MB/s",
                 progress.client_info,
@@ -131,15 +137,18 @@ async fn progress_logger(downloads: Arc<Mutex<HashMap<String, DownloadProgress>>
                 speed as f64 / (1024.0 * 1024.0)
             );
         }
-        
+
         guard.retain(|_, progress| progress.bytes_sent < progress.total_size);
     }
 }
 
 async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     let start = Instant::now();
-    info!("List objects request received from {}", get_client_info(&req));
-    
+    info!(
+        "List objects request received from {}",
+        get_client_info(&req)
+    );
+
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S.000Z").to_string();
     let mut contents = Vec::new();
     let mut total_size: u64 = 0;
@@ -147,16 +156,16 @@ async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Respo
 
     if let Ok(entries) = fs::read_dir(&data.storage_path) {
         debug!("Reading directory: {:?}", data.storage_path);
-        
+
         for entry in entries.flatten() {
             if let Ok(metadata) = entry.metadata() {
                 if metadata.is_file() {
                     if let Ok(file_name) = entry.file_name().into_string() {
                         total_size += metadata.len();
                         file_count += 1;
-                        
+
                         debug!("Found file: {}, size: {} bytes", file_name, metadata.len());
-                        
+
                         contents.push(Contents {
                             key: file_name,
                             last_modified: now.clone(),
@@ -180,22 +189,27 @@ async fn list_objects(req: HttpRequest, data: web::Data<AppState>) -> impl Respo
     };
 
     let xml = to_string(&result).unwrap_or_default();
-    
+
     info!(
         "List operation completed in {:?}. Found {} files, total size: {} bytes",
         start.elapsed(),
         file_count,
         total_size
     );
-    
-    HttpResponse::Ok()
-        .content_type("application/xml")
-        .body(xml)
+
+    HttpResponse::Ok().content_type("application/xml").body(xml)
 }
 
-async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<AppState>) -> impl Responder {
+async fn get_object(
+    req: HttpRequest,
+    path: web::Path<String>,
+    data: web::Data<AppState>,
+) -> impl Responder {
     let client_info = get_client_info(&req);
-    info!("Get object request received for '{}' from {}", path, client_info);
+    info!(
+        "Get object request received for '{}' from {}",
+        path, client_info
+    );
 
     let file_path = data.storage_path.join(&*path);
     debug!("Attempting to read file: {:?}", file_path);
@@ -209,7 +223,7 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
     };
 
     let file_size = metadata.len();
-    
+
     // Calculate MD5 hash for ETag
     let mut file = match fs::File::open(&file_path) {
         Ok(file) => file,
@@ -218,15 +232,15 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
             return HttpResponse::InternalServerError().finish();
         }
     };
-    
+
     // Read the file content for MD5 calculation
     let mut buffer = Vec::new();
     if let Err(e) = std::io::Read::read_to_end(&mut file, &mut buffer) {
         error!("Failed to read file for MD5 calculation: {}", e);
         return HttpResponse::InternalServerError().finish();
     }
-    
-    // Calculate MD5 hash
+
+    // Calculate MD5 hash and other response headers
     let etag = format!("\"{:x}\"", md5::compute(&buffer));
     let last_modified = chrono::Utc::now()
         .format("%a, %d %b %Y %H:%M:%S GMT")
@@ -235,18 +249,21 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
     if let Some(range_header) = req.headers().get(header::RANGE) {
         if let Some(range_str) = range_header.to_str().ok() {
             debug!("Range header received: {}", range_str);
-            
+
             if let Some(byte_range) = ByteRange::parse(range_str, file_size) {
-                debug!("Parsed range: start={}, end={:?}", byte_range.start, byte_range.end);
-                
+                debug!(
+                    "Parsed range: start={}, end={:?}",
+                    byte_range.start, byte_range.end
+                );
+
                 if let Ok(mut file) = fs::File::open(&file_path) {
                     use std::io::{Read, Seek, SeekFrom};
-                    
+
                     if file.seek(SeekFrom::Start(byte_range.start)).is_ok() {
                         let end = byte_range.end.unwrap_or(file_size - 1);
                         let length = end - byte_range.start + 1;
                         let mut buffer = vec![0; length as usize];
-                        
+
                         if file.read_exact(&mut buffer).is_ok() {
                             info!(
                                 "Serving partial content for '{}': bytes {}-{}/{} to {}",
@@ -255,7 +272,10 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
 
                             let mut response = HttpResponse::PartialContent();
                             response
-                                .append_header(("Content-Range", format!("bytes {}-{}/{}", byte_range.start, end, file_size)))
+                                .append_header((
+                                    "Content-Range",
+                                    format!("bytes {}-{}/{}", byte_range.start, end, file_size),
+                                ))
                                 .append_header(("Content-Length", length.to_string()))
                                 .append_header(("Last-Modified", last_modified))
                                 .append_header(("ETag", etag))
@@ -276,6 +296,15 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
             .finish();
     }
 
+    // Create a new file handle for streaming
+    let std_file = match fs::File::open(&file_path) {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to open file for streaming: {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
     let download_id = format!("{}-{}", Utc::now().timestamp_millis(), path);
     let progress = DownloadProgress {
         client_info: client_info.clone(),
@@ -283,31 +312,73 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
         total_size: file_size,
         bytes_sent: 0,
         start_time: Instant::now(),
+        last_chunk_time: Instant::now(),
     };
-    
-    data.downloads.lock().await.insert(download_id.clone(), progress);
 
-    let file = tokio::fs::File::from_std(file);
+    data.downloads
+        .lock()
+        .await
+        .insert(download_id.clone(), progress);
+
+    let file = tokio::fs::File::from_std(std_file);
     let stream = tokio_util::io::ReaderStream::new(file);
-    
-    let downloads = Arc::clone(&data.downloads);
-    let download_id = download_id.clone();
 
-    let mapped_stream = stream.map(move |result| {
-        match result {
-            Ok(chunk) => {
-                let chunk_len = chunk.len() as u64;
-                let downloads = downloads.clone();
-                let download_id = download_id.clone();
-                tokio::spawn(async move {
-                    let mut guard = downloads.lock().await;
-                    if let Some(progress) = guard.get_mut(&download_id) {
-                        progress.bytes_sent += chunk_len;
+    const RATE_LIMIT: u64 = 10000; // bytes per second
+    const CHUNK_SIZE: usize = 10000; // bytes per chunk
+
+    let downloads = Arc::clone(&data.downloads);
+    let download_id_clone = download_id.clone();
+
+    let rate_limited_stream = stream.then(move |result| {
+        let downloads = downloads.clone();
+        let download_id = download_id_clone.clone();
+
+        async move {
+            match result {
+                Ok(chunk) => {
+                    let mut remaining_chunk = chunk;
+                    let mut processed_chunk = Vec::new();
+
+                    while !remaining_chunk.is_empty() {
+                        let current_size = std::cmp::min(remaining_chunk.len(), CHUNK_SIZE);
+                        let current_chunk = remaining_chunk.slice(0..current_size);
+                        remaining_chunk = remaining_chunk.slice(current_size..);
+
+                        let chunk_len = current_chunk.len() as u64;
+
+                        // Update progress and apply rate limiting
+                        let mut guard = downloads.lock().await;
+                        if let Some(progress) = guard.get_mut(&download_id) {
+                            let elapsed = progress.last_chunk_time.elapsed();
+                            let required_delay =
+                                Duration::from_secs_f64(chunk_len as f64 / RATE_LIMIT as f64);
+
+                            // If we need to wait longer to maintain the rate limit, sleep
+                            if elapsed < required_delay {
+                                let sleep_duration = required_delay - elapsed;
+                                drop(guard); // Release the lock before sleeping
+                                time::sleep(sleep_duration).await;
+                                guard = downloads.lock().await;
+                                if let Some(progress) = guard.get_mut(&download_id) {
+                                    progress.bytes_sent += chunk_len;
+                                    progress.last_chunk_time = Instant::now();
+                                }
+                            } else {
+                                progress.bytes_sent += chunk_len;
+                                progress.last_chunk_time = Instant::now();
+                            }
+                        }
+
+                        processed_chunk.extend_from_slice(&current_chunk);
                     }
-                });
-                Ok(chunk)
+
+                    Ok(Bytes::from(processed_chunk))
+                }
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )),
             }
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
         }
     });
 
@@ -322,7 +393,7 @@ async fn get_object(req: HttpRequest, path: web::Path<String>, data: web::Data<A
         .append_header(("Server", "AmazonS3"))
         .append_header(("Connection", "close"));
 
-    response.streaming(mapped_stream)
+    response.streaming(rate_limited_stream)
 }
 
 #[actix_web::main]
@@ -344,7 +415,10 @@ async fn main() -> std::io::Result<()> {
     let storage_path = PathBuf::from("storage");
     if let Err(e) = fs::create_dir_all(&storage_path) {
         error!("Failed to create storage directory: {}", e);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "Failed to create storage directory"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to create storage directory",
+        ));
     }
 
     let downloads = Arc::new(Mutex::new(HashMap::new()));
