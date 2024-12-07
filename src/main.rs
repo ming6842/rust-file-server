@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::io::Error;
 
 #[derive(Serialize)]
 struct ListBucketResult {
@@ -247,7 +249,6 @@ async fn get_object(
 
     const RATE_LIMIT: u64 = 1000; // bytes per second
     const CHUNK_SIZE: usize = 1000; // bytes per chunk
-
     if let Some(range_header) = req.headers().get(header::RANGE) {
         if let Some(range_str) = range_header.to_str().ok() {
             debug!("Range header received: {}", range_str);
@@ -258,7 +259,7 @@ async fn get_object(
                     byte_range.start, byte_range.end
                 );
     
-                if let Ok(file) = fs::File::open(&file_path) {
+                if let Ok(std_file) = fs::File::open(&file_path) {
                     let end = byte_range.end.unwrap_or(file_size - 1);
                     let length = end - byte_range.start + 1;
     
@@ -277,15 +278,18 @@ async fn get_object(
                         .await
                         .insert(download_id.clone(), progress);
     
-                    let file = tokio::fs::File::from_std(file);
-                    
-                    // Create a custom stream that respects the byte range
-                    let stream = tokio_util::io::ReaderStream::new(file)
-                        .skip(byte_range.start as usize / CHUNK_SIZE)
-                        .take((length as usize + CHUNK_SIZE - 1) / CHUNK_SIZE);
+                    // Convert to async file and seek to start position
+                    let mut file = tokio::fs::File::from_std(std_file);
+                    if let Err(_) = file.seek(tokio::io::SeekFrom::Start(byte_range.start)).await {
+                        return HttpResponse::InternalServerError().finish();
+                    }
     
                     let downloads = Arc::clone(&data.downloads);
                     let download_id_clone = download_id.clone();
+                    
+                    // Create a limited reader that will stop after reading 'length' bytes
+                    let limited_reader = file.take(length);
+                    let stream = tokio_util::io::ReaderStream::new(limited_reader);
     
                     let rate_limited_stream = stream.then(move |result| {
                         let downloads = downloads.clone();
@@ -294,41 +298,39 @@ async fn get_object(
                         async move {
                             match result {
                                 Ok(chunk) => {
-                                    let mut remaining_chunk = chunk;
-                                    let mut processed_chunk = Vec::new();
+                                    let chunk_len = chunk.len() as u64;
+                                    
+                                    // Update progress and apply rate limiting
+                                    let mut guard = downloads.lock().await;
+                                    if let Some(progress) = guard.get_mut(&download_id) {
+                                        let elapsed = progress.last_chunk_time.elapsed();
+                                        let required_delay = Duration::from_secs_f64(
+                                            chunk_len as f64 / RATE_LIMIT as f64,
+                                        );
     
-                                    while !remaining_chunk.is_empty() {
-                                        let current_size = std::cmp::min(remaining_chunk.len(), CHUNK_SIZE);
-                                        let current_chunk = remaining_chunk.slice(0..current_size);
-                                        remaining_chunk = remaining_chunk.slice(current_size..);
-    
-                                        let chunk_len = current_chunk.len() as u64;
-    
-                                        // Update progress and apply rate limiting
-                                        let mut guard = downloads.lock().await;
-                                        if let Some(progress) = guard.get_mut(&download_id) {
-                                            let elapsed = progress.last_chunk_time.elapsed();
-                                            let required_delay = Duration::from_secs_f64(
-                                                chunk_len as f64 / RATE_LIMIT as f64,
-                                            );
-    
-                                            // If we need to wait longer to maintain the rate limit, sleep
-                                            if elapsed < required_delay {
-                                                let sleep_duration = required_delay - elapsed;
-                                                drop(guard); // Release the lock before sleeping
-                                                time::sleep(sleep_duration).await;
-                                                guard = downloads.lock().await;
-                                                if let Some(progress) = guard.get_mut(&download_id) {
-                                                    progress.bytes_sent += chunk_len;
-                                                    progress.last_chunk_time = Instant::now();
-                                                }
-                                            } else {
+                                        if elapsed < required_delay {
+                                            let sleep_duration = required_delay - elapsed;
+                                            drop(guard);
+                                            time::sleep(sleep_duration).await;
+                                            guard = downloads.lock().await;
+                                            if let Some(progress) = guard.get_mut(&download_id) {
                                                 progress.bytes_sent += chunk_len;
                                                 progress.last_chunk_time = Instant::now();
                                             }
+                                        } else {
+                                            progress.bytes_sent += chunk_len;
+                                            progress.last_chunk_time = Instant::now();
                                         }
+                                    }
     
-                                        processed_chunk.extend_from_slice(&current_chunk);
+                                    // Process chunk with rate limiting
+                                    let mut remaining = chunk;
+                                    let mut processed_chunk = Vec::new();
+                                    
+                                    while !remaining.is_empty() {
+                                        let size = std::cmp::min(remaining.len(), CHUNK_SIZE);
+                                        processed_chunk.extend_from_slice(&remaining.slice(0..size));
+                                        remaining = remaining.slice(size..);
                                     }
     
                                     Ok(Bytes::from(processed_chunk))
@@ -340,6 +342,7 @@ async fn get_object(
                             }
                         }
                     });
+    
                     info!(
                         "Serving partial content for '{}': bytes {}-{}/{} to {}",
                         path, byte_range.start, end, file_size, client_info
@@ -358,7 +361,7 @@ async fn get_object(
                         .append_header(("x-amz-server-side-encryption", "AES256"))
                         .append_header(("Content-Type", "binary/octet-stream"))
                         .append_header(("Server", "AmazonS3"))
-                        .no_chunking(length) // Pass the length parameter
+                        .no_chunking(length)
                         .streaming(rate_limited_stream);
                 }
             }
