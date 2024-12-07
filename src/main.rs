@@ -323,8 +323,8 @@ async fn get_object(
     let file = tokio::fs::File::from_std(std_file);
     let stream = tokio_util::io::ReaderStream::new(file);
 
-    const RATE_LIMIT: u64 = 10000; // bytes per second
-    const CHUNK_SIZE: usize = 10000; // bytes per chunk
+    const RATE_LIMIT: u64 = 1000; // bytes per second
+    const CHUNK_SIZE: usize = 1000; // bytes per chunk
 
     let downloads = Arc::clone(&data.downloads);
     let download_id_clone = download_id.clone();
