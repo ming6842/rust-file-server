@@ -251,17 +251,17 @@ async fn get_object(
     if let Some(range_header) = req.headers().get(header::RANGE) {
         if let Some(range_str) = range_header.to_str().ok() {
             debug!("Range header received: {}", range_str);
-
+    
             if let Some(byte_range) = ByteRange::parse(range_str, file_size) {
                 debug!(
                     "Parsed range: start={}, end={:?}",
                     byte_range.start, byte_range.end
                 );
-
+    
                 if let Ok(file) = fs::File::open(&file_path) {
                     let end = byte_range.end.unwrap_or(file_size - 1);
                     let length = end - byte_range.start + 1;
-
+    
                     let download_id = format!("{}-{}-partial", Utc::now().timestamp_millis(), path);
                     let progress = DownloadProgress {
                         client_info: client_info.clone(),
@@ -271,38 +271,39 @@ async fn get_object(
                         start_time: Instant::now(),
                         last_chunk_time: Instant::now(),
                     };
-
+    
                     data.downloads
                         .lock()
                         .await
                         .insert(download_id.clone(), progress);
-
+    
                     let file = tokio::fs::File::from_std(file);
+                    
+                    // Create a custom stream that respects the byte range
                     let stream = tokio_util::io::ReaderStream::new(file)
                         .skip(byte_range.start as usize / CHUNK_SIZE)
                         .take((length as usize + CHUNK_SIZE - 1) / CHUNK_SIZE);
-
+    
                     let downloads = Arc::clone(&data.downloads);
                     let download_id_clone = download_id.clone();
-
+    
                     let rate_limited_stream = stream.then(move |result| {
                         let downloads = downloads.clone();
                         let download_id = download_id_clone.clone();
-
+    
                         async move {
                             match result {
                                 Ok(chunk) => {
                                     let mut remaining_chunk = chunk;
                                     let mut processed_chunk = Vec::new();
-
+    
                                     while !remaining_chunk.is_empty() {
-                                        let current_size =
-                                            std::cmp::min(remaining_chunk.len(), CHUNK_SIZE);
+                                        let current_size = std::cmp::min(remaining_chunk.len(), CHUNK_SIZE);
                                         let current_chunk = remaining_chunk.slice(0..current_size);
                                         remaining_chunk = remaining_chunk.slice(current_size..);
-
+    
                                         let chunk_len = current_chunk.len() as u64;
-
+    
                                         // Update progress and apply rate limiting
                                         let mut guard = downloads.lock().await;
                                         if let Some(progress) = guard.get_mut(&download_id) {
@@ -310,15 +311,14 @@ async fn get_object(
                                             let required_delay = Duration::from_secs_f64(
                                                 chunk_len as f64 / RATE_LIMIT as f64,
                                             );
-
+    
                                             // If we need to wait longer to maintain the rate limit, sleep
                                             if elapsed < required_delay {
                                                 let sleep_duration = required_delay - elapsed;
                                                 drop(guard); // Release the lock before sleeping
                                                 time::sleep(sleep_duration).await;
                                                 guard = downloads.lock().await;
-                                                if let Some(progress) = guard.get_mut(&download_id)
-                                                {
+                                                if let Some(progress) = guard.get_mut(&download_id) {
                                                     progress.bytes_sent += chunk_len;
                                                     progress.last_chunk_time = Instant::now();
                                                 }
@@ -327,10 +327,10 @@ async fn get_object(
                                                 progress.last_chunk_time = Instant::now();
                                             }
                                         }
-
+    
                                         processed_chunk.extend_from_slice(&current_chunk);
                                     }
-
+    
                                     Ok(Bytes::from(processed_chunk))
                                 }
                                 Err(e) => Err(std::io::Error::new(
@@ -340,14 +340,13 @@ async fn get_object(
                             }
                         }
                     });
-
                     info!(
                         "Serving partial content for '{}': bytes {}-{}/{} to {}",
                         path, byte_range.start, end, file_size, client_info
                     );
-
+    
                     let mut response = HttpResponse::PartialContent();
-                    response
+                    return response
                         .append_header((
                             "Content-Range",
                             format!("bytes {}-{}/{}", byte_range.start, end, file_size),
@@ -359,9 +358,8 @@ async fn get_object(
                         .append_header(("x-amz-server-side-encryption", "AES256"))
                         .append_header(("Content-Type", "binary/octet-stream"))
                         .append_header(("Server", "AmazonS3"))
-                        .append_header(("Connection", "close"));
-
-                    return response.streaming(rate_limited_stream);
+                        .no_chunking(length) // Pass the length parameter
+                        .streaming(rate_limited_stream);
                 }
             }
         }
